@@ -1,0 +1,5 @@
+{
+  "name": "lens-monorepo",
+  "private": true,
+  "workspaces": ["packages/*"]
+}

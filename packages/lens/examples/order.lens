@@ -1,0 +1,56 @@
+// ============================================================
+// Example: Order data integration with bidirectional sync
+// ============================================================
+
+type OrderStatus = pending | confirmed | shipped | delivered | cancelled
+
+// Internal order schema (canonical)
+schema Order {
+    id: Uuid @id
+    customer_name: String
+    total: Decimal @min(0)
+    status: OrderStatus
+    created_at: DateTime @immutable
+}
+
+// External API schema (partner system)
+schema ExternalOrder {
+    order_id: String
+    customer_full_name: String
+    amount: String
+    state: String
+    placed_at: String
+}
+
+// Bidirectional mapping: sync between internal and external
+bidirectional SyncOrder : Order <-> ExternalOrder {
+    forward {
+        order_id           = source.id |> to_string
+        customer_full_name = source.customer_name
+        amount             = source.total |> to_string
+        state              = match source.status {
+            pending    => "NEW"
+            confirmed  => "CONFIRMED"
+            shipped    => "SHIPPED"
+            delivered  => "DONE"
+            cancelled  => "CANCELLED"
+            _          => "UNKNOWN"
+        }
+        placed_at          = source.created_at |> to_string
+    }
+
+    backward {
+        id             = source.order_id |> parse_uuid
+        customer_name  = source.customer_full_name
+        total          = source.amount |> parse_int
+        status         = match source.state {
+            "NEW"       => pending
+            "CONFIRMED" => confirmed
+            "SHIPPED"   => shipped
+            "DONE"      => delivered
+            "CANCELLED" => cancelled
+            _           => pending
+        }
+        created_at     = now()
+    }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "lens",
+  "version": "0.1.0",
+  "description": "Lens DSL — a schema-first data integration language",
+  "main": "dist/index.js",
+  "bin": {
+    "lens": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node dist/test.js",
+    "lens:check": "node dist/cli.js check",
+    "lens:generate": "node dist/cli.js generate"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

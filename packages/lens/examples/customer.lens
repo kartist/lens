@@ -1,0 +1,71 @@
+// ============================================================
+// Example: Customer data integration from legacy system
+// ============================================================
+
+// Semantic types — give meaning to raw primitives
+type Email = /^[^@]+@[^@]+\.[^@]+$/
+type Phone = String
+type CountryCode = "CN" | "US" | "JP" | "UK"
+type CustomerStatus = active | inactive | suspended
+
+// ---- Source: Legacy database schema ----
+schema LegacyCustomer {
+    legacy_id: String @id
+    full_name: String @required @max(200)
+    contact_email: String
+    addr_line1: String
+    addr_line2: String?
+    city_name: String
+    country_abbr: String
+    zip_code: String?
+    account_status: String
+    phone_1: String?
+    phone_2: String?
+    created_at: DateTime
+}
+
+// ---- Target: Modern API schema ----
+schema Customer {
+    id: Uuid @id @auto
+    name: String @required @max(200)
+    email: Email?
+    phone: Phone[]
+    address: Address
+    status: CustomerStatus
+    created_at: DateTime @immutable
+    updated_at: DateTime @audit
+}
+
+schema Address {
+    line1: String
+    line2: String?
+    city: String
+    country: CountryCode
+    postcode: String?
+}
+
+// ---- Mapping: Legacy -> Customer ----
+mapping LegacyToCustomer : LegacyCustomer -> Customer {
+    id          = source.legacy_id |> parse_uuid
+    name        = source.full_name |> trim |> title_case
+    email       = source.contact_email |> normalize_email
+    phone       = [source.phone_1?, source.phone_2?] |> filter_none
+    address     = map source via AddressMapping
+    status      = match source.account_status {
+        "A" | "B" => active
+        "S"      => suspended
+        "X"      => inactive
+        _         => inactive
+    }
+    created_at  = source.created_at
+    updated_at  = now()
+}
+
+// ---- Sub-mapping for nested structure ----
+mapping AddressMapping : LegacyCustomer -> Address {
+    line1     = source.addr_line1
+    line2     = source.addr_line2
+    city      = source.city_name |> normalize_city
+    country   = source.country_abbr
+    postcode  = source.zip_code
+}
