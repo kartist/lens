@@ -1,14 +1,14 @@
 // ============================================================
-// TypeScript Code Generator — compiles Lens AST to TypeScript
+// TypeScript Code Generator — compiles Lens IR to TypeScript
 // ============================================================
 
 import {
-  Document, SchemaDecl, TypeAliasDecl, MappingDecl,
-  BidirectionalMappingDecl, MappingBlock, MappingField, MappingExpr,
-  FieldAccessExpr, LiteralExpr, FunctionCallExpr, MatchExpr,
-  PipeExpr, BinaryExpr, CoalesceExpr, SubMappingExpr,
-  ArrayLiteralExpr, Annotation, TypeAliasDef, TypeExpr,
-} from '../parser/ast';
+  IRDocument, IRSchema, IRSchemaField, IRAnnotation,
+  IRTypeAlias, IRMapping, IRMappingField, IRExpr,
+  IRFieldAccess, IRLiteral, IRFunctionCall, IRMatch,
+  IRMatchArm, IRPipe, IRBinary, IRCoalesce, IRSubMapping,
+  IRArrayLiteral, IResolvedType,
+} from '../ir';
 
 export interface GenerateOptions {
   outputDir?: string;
@@ -16,7 +16,7 @@ export interface GenerateOptions {
   generateMappings?: boolean;
 }
 
-export function generateTypeScript(document: Document, options: GenerateOptions = {}): string {
+export function generateTypeScript(ir: IRDocument, options: GenerateOptions = {}): string {
   const opts = { generateSchemas: true, generateMappings: true, ...options };
   const lines: string[] = [];
 
@@ -25,30 +25,14 @@ export function generateTypeScript(document: Document, options: GenerateOptions 
   lines.push('// ============================================================');
   lines.push('');
 
-  // Separate declarations
-  const schemas: SchemaDecl[] = [];
-  const typeAliases: TypeAliasDecl[] = [];
-  const mappings: MappingDecl[] = [];
-  const bidirMappings: BidirectionalMappingDecl[] = [];
-
-  for (const decl of document.declarations) {
-    switch (decl.kind) {
-      case 'schema_decl': schemas.push(decl); break;
-      case 'type_alias_decl': typeAliases.push(decl); break;
-      case 'mapping_decl': mappings.push(decl); break;
-      case 'bidirectional_mapping_decl': bidirMappings.push(decl); break;
-    }
-  }
-
-  // Generate type aliases (as TypeScript types)
+  // Generate type aliases
   if (opts.generateSchemas) {
-    for (const ta of typeAliases) {
+    for (const ta of ir.typeAliases) {
       lines.push(...generateTypeAlias(ta));
       lines.push('');
     }
 
-    // Generate schema interfaces
-    for (const schema of schemas) {
+    for (const schema of ir.schemas) {
       lines.push(...generateSchemaInterface(schema));
       lines.push('');
     }
@@ -56,13 +40,12 @@ export function generateTypeScript(document: Document, options: GenerateOptions 
 
   // Generate mapping functions
   if (opts.generateMappings) {
-    for (const mapping of mappings) {
-      lines.push(...generateMappingFunction(mapping));
-      lines.push('');
-    }
-
-    for (const bidir of bidirMappings) {
-      lines.push(...generateBidirectionalMapping(bidir));
+    for (const mapping of ir.mappings) {
+      if (mapping.isBidirectional) {
+        lines.push(...generateBidirectionalMapping(mapping));
+      } else {
+        lines.push(...generateMappingFunction(mapping));
+      }
       lines.push('');
     }
   }
@@ -70,37 +53,37 @@ export function generateTypeScript(document: Document, options: GenerateOptions 
   return lines.join('\n');
 }
 
-// ---- Type Alias Codegen ----
-function generateTypeAlias(ta: TypeAliasDecl): string[] {
+// ---- Type Alias ----
+function generateTypeAlias(ta: IRTypeAlias): string[] {
   const lines: string[] = [];
   lines.push(`// Type alias: ${ta.name}`);
 
-  if (ta.definition.kind === 'alias_regex') {
-    lines.push(`// Refined type with pattern: ${ta.definition.pattern}`);
-    lines.push(`export type ${ta.name} = string; // refined: ${ta.definition.pattern}`);
-  } else if (ta.definition.kind === 'alias_union') {
-    const variants = ta.definition.variants.map(v => `'${v}'`).join(' | ');
+  if (ta.defKind === 'regex') {
+    lines.push(`// Refined type with pattern: ${ta.pattern}`);
+    lines.push(`export type ${ta.name} = string; // refined: ${ta.pattern}`);
+  } else if (ta.defKind === 'union') {
+    const variants = (ta.variants ?? []).map((v: string) => `'${v}'`).join(' | ');
     lines.push(`export type ${ta.name} = ${variants};`);
-  } else if (ta.definition.kind === 'alias_wrapper') {
-    const tsType = typeExprToTs(ta.definition.inner);
+  } else {
+    const tsType = irTypeToTs(ta.resolvedType);
     lines.push(`export type ${ta.name} = ${tsType};`);
   }
 
   return lines;
 }
 
-// ---- Schema Interface Codegen ----
-function generateSchemaInterface(schema: SchemaDecl): string[] {
+// ---- Schema Interface ----
+function generateSchemaInterface(schema: IRSchema): string[] {
   const lines: string[] = [];
   lines.push(`// Schema: ${schema.name}`);
   lines.push(`export interface ${schema.name} {`);
 
   for (const field of schema.fields) {
-    const anns = field.annotations.map(a => formatAnnotation(a)).filter(Boolean);
+    const anns = field.annotations.map(formatAnnotation).filter(Boolean);
     if (anns.length > 0) {
       lines.push(`  /** ${anns.join(', ')} */`);
     }
-    const tsType = typeExprToTs(field.type);
+    const tsType = irTypeToTs(field.type);
     lines.push(`  ${field.name}: ${tsType};`);
   }
 
@@ -108,23 +91,23 @@ function generateSchemaInterface(schema: SchemaDecl): string[] {
   return lines;
 }
 
-// ---- Type Expression → TypeScript ----
-function typeExprToTs(type: TypeExpr): string {
-  switch (type.kind) {
+// ---- Type → TypeScript ----
+function irTypeToTs(t: IResolvedType): string {
+  switch (t.kind) {
     case 'primitive':
-      return primitiveToTs(type.name);
+      return primitiveToTs(t.name);
     case 'nominal':
-      return type.name;
+      return t.name;
     case 'optional':
-      return `${typeExprToTs(type.inner)} | null`;
+      return `${irTypeToTs(t.inner)} | null`;
     case 'array':
-      return `${typeExprToTs(type.inner)}[]`;
+      return `${irTypeToTs(t.inner)}[]`;
     case 'union':
-      return type.variants.map(v => typeExprToTs(v)).join(' | ');
+      return t.variants.map((v: IResolvedType) => irTypeToTs(v)).join(' | ');
     case 'refined':
-      return typeExprToTs(type.base);
+      return irTypeToTs(t.base);
     case 'schema_ref':
-      return type.name;
+      return t.name;
   }
 }
 
@@ -142,43 +125,32 @@ function primitiveToTs(name: string): string {
   }
 }
 
-function formatAnnotation(a: Annotation): string {
-  if (a.args.length === 0) return `@${a.name}`;
-  const args = a.args.map(arg => {
-    switch (arg.kind) {
-      case 'arg_string': return `"${arg.value}"`;
-      case 'arg_number': return String(arg.value);
-      case 'arg_boolean': return String(arg.value);
-      case 'arg_identifier': return arg.value;
-      case 'arg_regex': return `/${arg.value}/`;
-    }
+function formatAnnotation(ann: IRAnnotation): string {
+  if (ann.args.length === 0) return `@${ann.name}`;
+  const args = ann.args.map((a: string | number | boolean) => {
+    if (typeof a === 'string') return `"${a}"`;
+    return String(a);
   }).join(', ');
-  return `@${a.name}(${args})`;
+  return `@${ann.name}(${args})`;
 }
 
-// ---- Mapping Function Codegen ----
-function generateMappingFunction(mapping: MappingDecl): string[] {
+// ---- Mapping Function ----
+function generateMappingFunction(mapping: IRMapping): string[] {
   const lines: string[] = [];
-  const sourceType = mapping.source;
-  const targetType = mapping.target;
-
-  lines.push(`// Mapping: ${mapping.name} (${sourceType} -> ${targetType})`);
-  lines.push(`export function ${mapping.name}(source: ${sourceType}): ${targetType} {`);
+  lines.push(`// Mapping: ${mapping.name} (${mapping.source} -> ${mapping.target})`);
+  lines.push(`export function ${mapping.name}(source: ${mapping.source}): ${mapping.target} {`);
   lines.push(`  return {`);
-
   for (const field of mapping.fields) {
-    const valueExpr = mappingExprToTs(field.expression, 'source');
+    const valueExpr = exprToTs(field.expression, 'source');
     lines.push(`    ${field.name}: ${valueExpr},`);
   }
-
   lines.push(`  };`);
   lines.push(`}`);
-
   return lines;
 }
 
-// ---- Bidirectional Mapping Codegen ----
-function generateBidirectionalMapping(mapping: BidirectionalMappingDecl): string[] {
+// ---- Bidirectional Mapping ----
+function generateBidirectionalMapping(mapping: IRMapping): string[] {
   const lines: string[] = [];
   const sourceType = mapping.source;
   const targetType = mapping.target;
@@ -188,8 +160,8 @@ function generateBidirectionalMapping(mapping: BidirectionalMappingDecl): string
   // Forward
   lines.push(`export function ${mapping.name}_forward(source: ${sourceType}): ${targetType} {`);
   lines.push(`  return {`);
-  for (const field of mapping.forward.fields) {
-    lines.push(`    ${field.name}: ${mappingExprToTs(field.expression, 'source')},`);
+  for (const field of mapping.fields) {
+    lines.push(`    ${field.name}: ${exprToTs(field.expression, 'source')},`);
   }
   lines.push(`  };`);
   lines.push(`}`);
@@ -197,8 +169,8 @@ function generateBidirectionalMapping(mapping: BidirectionalMappingDecl): string
   // Backward
   lines.push(`export function ${mapping.name}_backward(source: ${targetType}): ${sourceType} {`);
   lines.push(`  return {`);
-  for (const field of mapping.backward.fields) {
-    lines.push(`    ${field.name}: ${mappingExprToTs(field.expression, 'source')},`);
+  for (const field of (mapping.backwardFields ?? [])) {
+    lines.push(`    ${field.name}: ${exprToTs(field.expression, 'source')},`);
   }
   lines.push(`  };`);
   lines.push(`}`);
@@ -206,80 +178,58 @@ function generateBidirectionalMapping(mapping: BidirectionalMappingDecl): string
   return lines;
 }
 
-// ---- Mapping Expression → TypeScript ----
-function mappingExprToTs(expr: MappingExpr, sourceVar: string): string {
+// ---- Expression → TypeScript ----
+function exprToTs(expr: IRExpr, sourceVar: string): string {
   switch (expr.kind) {
-    case 'field_access':
-      return fieldAccessToTs(expr, sourceVar);
-    case 'literal':
-      return literalToTs(expr);
-    case 'function_call':
-      return functionCallToTs(expr, sourceVar);
-    case 'match':
-      return matchToTs(expr, sourceVar);
-    case 'pipe':
-      return pipeToTs(expr, sourceVar);
-    case 'binary':
-      return binaryToTs(expr, sourceVar);
-    case 'coalesce':
-      return coalesceToTs(expr, sourceVar);
-    case 'sub_mapping':
-      return subMappingToTs(expr, sourceVar);
-    case 'array_literal':
-      return arrayLiteralToTs(expr, sourceVar);
+    case 'field_access': return fieldAccessToTs(expr, sourceVar);
+    case 'literal': return literalToTs(expr);
+    case 'function_call': return functionCallToTs(expr, sourceVar);
+    case 'match': return matchToTs(expr, sourceVar);
+    case 'pipe': return pipeToTs(expr, sourceVar);
+    case 'binary': return binaryToTs(expr, sourceVar);
+    case 'coalesce': return coalesceToTs(expr, sourceVar);
+    case 'sub_mapping': return subMappingToTs(expr, sourceVar);
+    case 'array_literal': return arrayLiteralToTs(expr, sourceVar);
+    default: return 'null';
   }
 }
 
-function fieldAccessToTs(expr: FieldAccessExpr, sourceVar: string): string {
+function fieldAccessToTs(expr: IRFieldAccess, sourceVar: string): string {
   const path = expr.path;
-  
-  // If path starts with 'source', emit sourceVar.field...
   if (path.length > 0 && path[0] === 'source') {
     const fieldPath = path.slice(1);
     if (fieldPath.length === 0) return sourceVar;
     return `${sourceVar}.${fieldPath.join('.')}`;
   }
-  
-  // Standalone identifier — likely a variant literal
   return JSON.stringify(path[0]);
 }
 
-function literalToTs(expr: LiteralExpr): string {
+function literalToTs(expr: IRLiteral): string {
   if (typeof expr.value === 'string') return JSON.stringify(expr.value);
   if (expr.value === null) return 'null';
   return String(expr.value);
 }
 
-function functionCallToTs(expr: FunctionCallExpr, sourceVar: string): string {
+function functionCallToTs(expr: IRFunctionCall, sourceVar: string): string {
   const fnName = BUILTIN_FN_MAP[expr.name] ?? expr.name;
-  const args = expr.args.map(a => mappingExprToTs(a, sourceVar)).join(', ');
-  if (args) {
-    return `${fnName}(${args})`;
-  }
+  const args = expr.args.map((a: IRExpr) => exprToTs(a, sourceVar)).join(', ');
+  if (args) return `${fnName}(${args})`;
   return `${fnName}()`;
 }
 
-function matchToTs(expr: MatchExpr, sourceVar: string): string {
-  const subject = mappingExprToTs(expr.subject, sourceVar);
+function matchToTs(expr: IRMatch, sourceVar: string): string {
+  const subject = exprToTs(expr.subject, sourceVar);
   const lines: string[] = [];
-  
-  // Check if we're matching against enum-like union values
-  // Generate a switch or ternary chain
-  const arms = expr.arms.map(arm => {
-    const patterns = arm.pattern.kind === 'multi_pattern'
-      ? arm.pattern.values.map(v => JSON.stringify(v))
-      : arm.pattern.kind === 'literal_pattern'
-        ? [JSON.stringify(arm.pattern.value)]
-        : [];
-    const body = mappingExprToTs(arm.body, sourceVar);
-    return { patterns, body };
-  });
+
+  const arms = expr.arms.map((arm: IRMatchArm) => ({
+    patterns: arm.patterns.map((p: string | number | boolean) => JSON.stringify(p)),
+    body: exprToTs(arm.body, sourceVar),
+  }));
 
   const defaultBody = expr.defaultArm
-    ? mappingExprToTs(expr.defaultArm, sourceVar)
+    ? exprToTs(expr.defaultArm, sourceVar)
     : `(() => { throw new Error('Match error: no arm matched for ' + ${subject}); })()`;
 
-  // Use a switch for clarity
   lines.push(`(() => {`);
   lines.push(`  switch (${subject}) {`);
   for (const arm of arms) {
@@ -296,37 +246,32 @@ function matchToTs(expr: MatchExpr, sourceVar: string): string {
   return lines.join('\n');
 }
 
-function pipeToTs(expr: PipeExpr, sourceVar: string): string {
-  const left = mappingExprToTs(expr.left, sourceVar);
+function pipeToTs(expr: IRPipe, sourceVar: string): string {
+  const left = exprToTs(expr.left, sourceVar);
   if (expr.right.kind === 'function_call') {
     const fnName = BUILTIN_FN_MAP[expr.right.name] ?? expr.right.name;
-    const args = expr.right.args.map(a => mappingExprToTs(a, sourceVar));
+    const args = expr.right.args.map((a: IRExpr) => exprToTs(a, sourceVar));
     return `${fnName}(${left}${args.length > 0 ? ', ' + args.join(', ') : ''})`;
   }
-  // Fallback
-  return `${mappingExprToTs(expr.right, sourceVar)}(${left})`;
+  return `${exprToTs(expr.right, sourceVar)}(${left})`;
 }
 
-function binaryToTs(expr: BinaryExpr, sourceVar: string): string {
-  const left = mappingExprToTs(expr.left, sourceVar);
-  const right = mappingExprToTs(expr.right, sourceVar);
+function binaryToTs(expr: IRBinary, sourceVar: string): string {
+  const left = exprToTs(expr.left, sourceVar);
+  const right = exprToTs(expr.right, sourceVar);
   return `${left} ${expr.operator} ${right}`;
 }
 
-function coalesceToTs(expr: CoalesceExpr, sourceVar: string): string {
-  // The ? operator means: if this value is null/undefined, it's fine
-  // In TypeScript, accessing optional chain
-  const inner = mappingExprToTs(expr.expr, sourceVar);
-  return inner; // For MVP, just pass through — the type system handles null
+function coalesceToTs(expr: IRCoalesce, sourceVar: string): string {
+  return exprToTs(expr.expr, sourceVar);
 }
 
-function subMappingToTs(expr: SubMappingExpr, sourceVar: string): string {
-  // map source via MappingName
+function subMappingToTs(expr: IRSubMapping, sourceVar: string): string {
   return `${expr.mappingName}(${sourceVar})`;
 }
 
-function arrayLiteralToTs(expr: ArrayLiteralExpr, sourceVar: string): string {
-  const elements = expr.elements.map(e => mappingExprToTs(e, sourceVar)).join(', ');
+function arrayLiteralToTs(expr: IRArrayLiteral, sourceVar: string): string {
+  const elements = expr.elements.map((e: IRExpr) => exprToTs(e, sourceVar)).join(', ');
   return `[${elements}]`;
 }
 

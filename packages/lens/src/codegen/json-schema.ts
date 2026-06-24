@@ -1,28 +1,25 @@
 // ============================================================
-// JSON Schema Code Generator
+// JSON Schema Code Generator — compiles Lens IR to JSON Schema
 // ============================================================
 
-import { Document, SchemaDecl, TypeAliasDecl, TypeExpr, Annotation } from '../parser/ast';
+import { IRDocument, IRSchema, IRSchemaField, IRAnnotation, IResolvedType } from '../ir';
 
-export function generateJsonSchemas(document: Document): Record<string, object> {
+export function generateJsonSchemas(ir: IRDocument): Record<string, object> {
   const schemas: Record<string, object> = {};
 
-  // Separate schema declarations
-  for (const decl of document.declarations) {
-    if (decl.kind === 'schema_decl') {
-      schemas[decl.name] = generateJsonSchema(decl);
-    }
+  for (const schema of ir.schemas) {
+    schemas[schema.name] = generateJsonSchema(schema);
   }
 
   return schemas;
 }
 
-function generateJsonSchema(schema: SchemaDecl): object {
+function generateJsonSchema(schema: IRSchema): object {
   const properties: Record<string, object> = {};
   const required: string[] = [];
 
   for (const field of schema.fields) {
-    const fieldSchema = typeExprToJsonSchema(field.type);
+    const fieldSchema = irTypeToJsonSchema(field.type);
 
     // Apply annotations
     let finalFieldSchema = fieldSchema;
@@ -32,7 +29,7 @@ function generateJsonSchema(schema: SchemaDecl): object {
 
     // Check if required
     const isOptional = field.type.kind === 'optional' ||
-      field.annotations.some(a => a.name === 'auto' || a.name === 'audit');
+      field.annotations.some((a: IRAnnotation) => a.name === 'auto' || a.name === 'audit');
 
     properties[field.name] = finalFieldSchema;
     if (!isOptional) {
@@ -54,28 +51,28 @@ function generateJsonSchema(schema: SchemaDecl): object {
   return result;
 }
 
-function typeExprToJsonSchema(type: TypeExpr): object {
-  switch (type.kind) {
+function irTypeToJsonSchema(t: IResolvedType): object {
+  switch (t.kind) {
     case 'primitive':
-      return primitiveToJsonSchema(type.name);
+      return primitiveToJsonSchema(t.name);
     case 'nominal':
       // Nominal types are treated as strings with optional format
       return { type: 'string' };
     case 'optional':
-      return typeExprToJsonSchema(type.inner); // optional handled at field level
+      return irTypeToJsonSchema(t.inner);
     case 'array':
       return {
         type: 'array',
-        items: typeExprToJsonSchema(type.inner),
+        items: irTypeToJsonSchema(t.inner),
       };
     case 'union':
       return {
-        anyOf: type.variants.map(v => typeExprToJsonSchema(v)),
+        anyOf: t.variants.map((v: IResolvedType) => irTypeToJsonSchema(v)),
       };
     case 'refined':
-      return applyRefinement(typeExprToJsonSchema(type.base), type.constraint);
+      return applyRefinement(irTypeToJsonSchema(t.base), t.constraint);
     case 'schema_ref':
-      return { $ref: `#/definitions/${type.name}` };
+      return { $ref: `#/definitions/${t.name}` };
   }
 }
 
@@ -102,52 +99,49 @@ function primitiveToJsonSchema(name: string): object {
 }
 
 function applyRefinement(schema: object, constraint: string): object {
-  // A refined type like /pattern/ adds a regex pattern
   return {
     ...schema,
     pattern: constraint,
   };
 }
 
-function applyAnnotation(schema: object, ann: Annotation): object {
+function applyAnnotation(schema: object, ann: IRAnnotation): object {
   switch (ann.name) {
     case 'max': {
       const val = ann.args[0];
-      if (val && val.kind === 'arg_number') {
-        return { ...schema, maximum: val.value };
+      if (typeof val === 'number') {
+        return { ...schema, maximum: val };
       }
       break;
     }
     case 'min': {
       const val = ann.args[0];
-      if (val && val.kind === 'arg_number') {
-        return { ...schema, minimum: val.value };
+      if (typeof val === 'number') {
+        return { ...schema, minimum: val };
       }
       break;
     }
     case 'min_length': {
       const val = ann.args[0];
-      if (val && val.kind === 'arg_number') {
-        return { ...schema, minItems: val.value };
+      if (typeof val === 'number') {
+        return { ...schema, minItems: val };
       }
       break;
     }
     case 'max_length': {
       const val = ann.args[0];
-      if (val && val.kind === 'arg_number') {
-        return { ...schema, maxItems: val.value };
+      if (typeof val === 'number') {
+        return { ...schema, maxItems: val };
       }
       break;
     }
     case 'required':
-      // Already handled at field level
-      break;
     case 'id':
     case 'auto':
     case 'immutable':
     case 'audit':
     case 'references':
-      // These are Lens-specific — not directly representable in JSON Schema
+      // Handled at field level or Lens-specific
       break;
   }
   return schema;

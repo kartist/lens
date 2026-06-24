@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: packages/lens/package-lock.json
+
+      - name: Install dependencies
+        working-directory: packages/lens
+        run: npm ci
+
+      - name: Build
+        working-directory: packages/lens
+        run: npx tsc
+
+      - name: Test
+        working-directory: packages/lens
+        run: npx vitest run
+
+      - name: Verify CLI
+        working-directory: packages/lens
+        run: |
+          node dist/cli.js check examples/customer.lens
+          node dist/cli.js generate examples/customer.lens -o dist/test-ci -f python
+          python -c "import ast; ast.parse(open('dist/test-ci/customer.py').read()); print('Python OK')"
+
+  python-test:
+    runs-on: ubuntu-latest
+    needs: lint-build-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: packages/lens/package-lock.json
+
+      - name: Install and build
+        working-directory: packages/lens
+        run: npm ci && npx tsc
+
+      - name: Generate Python from examples
+        working-directory: packages/lens
+        run: |
+          node dist/cli.js generate examples/customer.lens -o dist/python-test -f python
+          node dist/cli.js generate examples/order.lens -o dist/python-test -f python
+
+      - name: Verify Python execution
+        working-directory: packages/lens
+        run: |
+          cd dist/python-test
+          python -c "
+          from customer import LegacyCustomer, LegacyToCustomer
+          from datetime import datetime
+          src = LegacyCustomer(
+              legacy_id='550e8400-e29b-41d4-a716-446655440000',
+              full_name='  john SMITH  ',
+              contact_email='John.Smith@EXAMPLE.COM',
+              addr_line1='123 Main St',
+              city_name='new york',
+              country_abbr='US',
+              account_status='A',
+              created_at=datetime(2020, 1, 1),
+          )
+          result = LegacyToCustomer(src)
+          assert result.name == 'John Smith', f'Expected John Smith, got {result.name}'
+          assert result.email == 'john.smith@example.com', f'Expected normalized email'
+          assert result.status == 'active', f'Expected active, got {result.status}'
+          print('Python mapping test: PASS')
+          "

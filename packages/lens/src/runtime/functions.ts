@@ -69,8 +69,8 @@ export function __parseInt(s: string): number {
 /**
  * Convert a number to a string.
  */
-export function __toString(n: number): string {
-  return String(n);
+export function __toString(val: unknown): string {
+  return String(val);
 }
 
 /**

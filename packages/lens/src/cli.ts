@@ -7,7 +7,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Parser, ParseError } from './parser';
 import { check, CheckError } from './checker';
-import { generateTypeScript, generateJsonSchemas } from './codegen';
+import { generateTypeScript, generateJsonSchemas, generatePython } from './codegen';
+import { generateIR } from './ir-generator';
+import { serializeIR } from './ir-json';
+import { executeMapping, executeBidirectionalMapping } from './runtime/interpreter';
 
 // Simple chalk-like coloring
 const colors = {
@@ -23,7 +26,15 @@ interface CliOptions {
   command: 'check' | 'generate' | 'run';
   files: string[];
   output?: string;
-  format?: 'typescript' | 'json-schema' | 'both';
+  format?: 'typescript' | 'json-schema' | 'python' | 'json-ir' | 'both';
+  /** Mapping name to execute (for run command) */
+  mapping?: string;
+  /** Direction for bidirectional mapping */
+  direction?: 'forward' | 'backward';
+  /** Watch mode — recompile on file changes */
+  watch?: boolean;
+  /** Output lineage information */
+  lineage?: boolean;
 }
 
 function parseArgs(args: string[]): CliOptions {
@@ -31,6 +42,11 @@ function parseArgs(args: string[]): CliOptions {
   const files: string[] = [];
   let output: string | undefined;
   let format: CliOptions['format'] = 'typescript';
+  let mapping: string | undefined;
+  let direction: 'forward' | 'backward' = 'forward';
+  let watch = false;
+
+  let lineage = false;
 
   let i = 1;
   while (i < args.length) {
@@ -43,6 +59,22 @@ function parseArgs(args: string[]): CliOptions {
       case '--format':
         format = args[++i] as CliOptions['format'];
         break;
+      case '-m':
+      case '--mapping':
+        mapping = args[++i];
+        break;
+      case '-d':
+      case '--direction':
+        direction = args[++i] as 'forward' | 'backward';
+        break;
+      case '-w':
+      case '--watch':
+        watch = true;
+        break;
+      case '-l':
+      case '--lineage':
+        lineage = true;
+        break;
       default:
         files.push(args[i]);
         break;
@@ -50,7 +82,42 @@ function parseArgs(args: string[]): CliOptions {
     i++;
   }
 
-  return { command, files, output, format };
+  return { command, files, output, format, mapping, direction, watch, lineage };
+}
+
+/** Expand glob patterns in file paths */
+function expandGlobs(patterns: string[]): string[] {
+  const result: string[] = [];
+  for (const pattern of patterns) {
+    if (pattern.includes('*') || pattern.includes('?')) {
+      // Simple glob: use fs.globSync if available (Node 22+), else manual
+      const dir = path.dirname(pattern) || '.';
+      const base = path.basename(pattern);
+      try {
+        // Only expand if the directory exists
+        if (fs.existsSync(dir)) {
+          const entries = fs.readdirSync(dir);
+          const regex = new RegExp(
+            '^' + base.replace(/\*/g, '.*').replace(/\?/g, '.') + '$'
+          );
+          for (const entry of entries) {
+            if (regex.test(entry)) {
+              const fullPath = path.join(dir, entry);
+              if (fs.statSync(fullPath).isFile()) {
+                result.push(fullPath);
+              }
+            }
+          }
+        }
+      } catch {
+        // If glob fails, keep the original pattern (will fail later with file-not-found)
+        result.push(pattern);
+      }
+    } else {
+      result.push(pattern);
+    }
+  }
+  return result;
 }
 
 function printUsage(): void {
@@ -60,16 +127,21 @@ function printUsage(): void {
   console.log('');
   console.log('Commands:');
   console.log('  check     Type-check .lens files');
-  console.log('  generate  Generate TypeScript / JSON Schema from .lens files');
-  console.log('  run       Execute a mapping against JSON data');
+  console.log('  generate  Generate TypeScript / JSON Schema / Python from .lens files');
+  console.log('  run       Execute a mapping against JSON data (read from stdin)');
   console.log('');
   console.log('Options:');
-  console.log('  -o, --output <dir>    Output directory for generated files');
-  console.log('  -f, --format <fmt>    Output format: typescript, json-schema, both');
+  console.log('  -o, --output <dir>     Output directory for generated files');
+  console.log('  -f, --format <fmt>     Output format: typescript, json-schema, python, json-ir, both');
+  console.log('  -m, --mapping <name>   Mapping name to execute (required for run)');
+  console.log('  -d, --direction <dir>  Direction for bidirectional mapping: forward, backward');
+  console.log('  -w, --watch            Watch files and recompile on change');
   console.log('');
   console.log('Examples:');
-  console.log('  lens check examples/customer.lens');
-  console.log('  lens generate examples/customer.lens -o dist/ -f both');
+  console.log('  lens check examples/*.lens');
+  console.log('  lens generate examples/customer.lens -o dist/ -f python');
+  console.log('  lens generate examples/*.lens -o dist/ -f json-ir');
+  console.log('  lens run examples/customer.lens -m LegacyToCustomer < data.json');
 }
 
 function formatSpan(span: { start: { line: number; column: number } }): string {
@@ -97,15 +169,41 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Collect and parse all files
+  // Expand glob patterns
+  const expandedFiles = expandGlobs(opts.files);
+  if (expandedFiles.length === 0) {
+    console.error(colors.red('Error: No files matched the given patterns'));
+    process.exit(1);
+  }
+
+  // Run once
+  const errorCount = await processFiles(expandedFiles, opts);
+
+  // Watch mode
+  if (opts.watch && (opts.command === 'generate' || opts.command === 'check')) {
+    console.log(colors.cyan(`\nWatching ${expandedFiles.length} file(s) for changes...`));
+    for (const file of expandedFiles) {
+      fs.watchFile(file, { interval: 500 }, async () => {
+        console.log(colors.cyan(`\n[${new Date().toLocaleTimeString()}] File changed: ${file}`));
+        await processFiles(expandedFiles, opts);
+      });
+    }
+    // Keep process alive
+    process.stdin.resume();
+  } else if (errorCount > 0) {
+    process.exit(1);
+  }
+}
+
+async function processFiles(files: string[], opts: CliOptions): Promise<number> {
   const parser = new Parser();
   const allErrors: (ParseError | CheckError)[] = [];
   const documents: { file: string; doc: ReturnType<typeof parser.parse>['document'] }[] = [];
 
-  for (const file of opts.files) {
+  for (const file of files) {
     if (!fs.existsSync(file)) {
       console.error(colors.red(`Error: File not found: ${file}`));
-      process.exit(1);
+      continue;
     }
 
     const source = fs.readFileSync(file, 'utf-8');
@@ -142,9 +240,10 @@ async function main(): Promise<void> {
 
     for (const { file, doc } of documents) {
       const basename = path.basename(file, '.lens');
+      const ir = generateIR(doc);
 
       if (opts.format === 'typescript' || opts.format === 'both') {
-        const tsCode = generateTypeScript(doc);
+        const tsCode = generateTypeScript(ir);
         const outPath = path.join(outputDir, `${basename}.ts`);
         fs.mkdirSync(path.dirname(outPath), { recursive: true });
         fs.writeFileSync(outPath, tsCode, 'utf-8');
@@ -152,13 +251,29 @@ async function main(): Promise<void> {
       }
 
       if (opts.format === 'json-schema' || opts.format === 'both') {
-        const schemas = generateJsonSchemas(doc);
+        const schemas = generateJsonSchemas(ir);
         for (const [name, schema] of Object.entries(schemas)) {
           const outPath = path.join(outputDir, `${name}.schema.json`);
           fs.mkdirSync(path.dirname(outPath), { recursive: true });
           fs.writeFileSync(outPath, JSON.stringify(schema, null, 2), 'utf-8');
           console.log(colors.green(`Generated: ${outPath}`));
         }
+      }
+
+      if (opts.format === 'python' || opts.format === 'both') {
+        const pyCode = generatePython(ir);
+        const outPath = path.join(outputDir, `${basename}.py`);
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, pyCode, 'utf-8');
+        console.log(colors.green(`Generated: ${outPath}`));
+      }
+
+      if (opts.format === 'json-ir' || opts.format === 'both') {
+        const irJson = serializeIR(ir);
+        const outPath = path.join(outputDir, `${basename}.ir.json`);
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, irJson, 'utf-8');
+        console.log(colors.green(`Generated: ${outPath}`));
       }
 
       // Also generate runtime
@@ -172,29 +287,64 @@ async function main(): Promise<void> {
   }
 
   if (opts.command === 'run') {
-    console.log(colors.yellow('Run mode: executing mapping with sample data...'));
-    // For now, just demonstrate by loading the first file
-    for (const { file, doc } of documents) {
-      console.log(colors.cyan(`\nFile: ${file}`));
-      console.log(`  Declarations: ${doc.declarations.length}`);
+    if (!opts.mapping) {
+      console.error(colors.red('Error: --mapping <name> is required for run command'));
+      return 1;
+    }
 
-      for (const decl of doc.declarations) {
-        switch (decl.kind) {
-          case 'schema_decl':
-            console.log(`  Schema: ${decl.name} (${decl.fields.length} fields)`);
-            break;
-          case 'mapping_decl':
-            console.log(`  Mapping: ${decl.name} (${decl.source} -> ${decl.target})`);
-            break;
-          case 'bidirectional_mapping_decl':
-            console.log(`  Bidirectional: ${decl.name} (${decl.source} <-> ${decl.target})`);
-            break;
-          case 'type_alias_decl':
-            console.log(`  Type: ${decl.name}`);
-            break;
+    // Read JSON from stdin
+    let stdin: string;
+    try {
+      stdin = fs.readFileSync(0, 'utf-8').trim();
+    } catch {
+      console.error(colors.red('Error: No JSON data provided on stdin'));
+      return 1;
+    }
+    if (!stdin) {
+      console.error(colors.red('Error: No JSON data provided on stdin'));
+      return 1;
+    }
+
+    let inputData: Record<string, unknown>;
+    try {
+      inputData = JSON.parse(stdin);
+    } catch {
+      console.error(colors.red('Error: Invalid JSON input'));
+      return 1;
+    }
+
+    // Use the first file's IR
+    for (const { file, doc } of documents) {
+      const ir = generateIR(doc);
+
+      try {
+        const result = executeMapping(ir, opts.mapping, inputData);
+        console.log(JSON.stringify(result.data, null, 2));
+        if (opts.lineage) {
+          console.log(colors.cyan('\n# Lineage:'));
+          for (const [field, source] of result.lineage) {
+            console.log(`  ${field} ← ${source}`);
+          }
+        }
+        return 0;
+      } catch {
+        try {
+          const result = executeBidirectionalMapping(ir, opts.mapping, opts.direction ?? 'forward', inputData);
+          console.log(JSON.stringify(result.data, null, 2));
+          if (opts.lineage) {
+            console.log(colors.cyan('\n# Lineage:'));
+            for (const [field, source] of result.lineage) {
+              console.log(`  ${field} ← ${source}`);
+            }
+          }
+          return 0;
+        } catch (e: any) {
+          console.error(colors.red(`Error executing mapping '${opts.mapping}': ${e.message}`));
+          return 1;
         }
       }
     }
+    return 1;
   }
 
   // Summary
@@ -206,9 +356,7 @@ async function main(): Promise<void> {
     console.log(`${colors.red(`${errorCount} error(s)`)} ${colors.yellow(`${warningCount} warning(s)`)}`);
   }
 
-  if (errorCount > 0) {
-    process.exit(1);
-  }
+  return errorCount;
 }
 
 function generateRuntime(): string {

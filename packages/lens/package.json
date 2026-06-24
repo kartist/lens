@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node dist/test.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lens:check": "node dist/cli.js check",
     "lens:generate": "node dist/cli.js generate"
   },
@@ -18,6 +19,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.9"
   }
 }
